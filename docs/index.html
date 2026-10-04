@@ -447,7 +447,7 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
 <!-- ══ SHEET 1 ══════════════════════════════════════════════════════════ -->
 <section class="sheet" id="s1" data-sheet="COLD START">
   <div class="wrap">
-    <div class="meta">DRAWING TKMK-0103 · REV F · SCALE 1:1 · SHEET 1 OF 7 · MPL-2.0</div>
+    <div class="meta">DRAWING TKMK-0104 · REV G · SCALE 1:1 · SHEET 1 OF 7 · MPL-2.0</div>
     <div class="hgrid">
       <div class="hcol" data-draw>
         <!-- Line breaks are explicit because the type size is solved against
@@ -468,7 +468,7 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
         </p>
         <div class="cta">
           <a class="stamp" href="https://github.com/360NoScopeGuru/tokamak/releases/latest">
-            ▸ DOWNLOAD v0.1.3<small>WINDOWS .MSI · LINUX .APPIMAGE</small>
+            ▸ DOWNLOAD v0.1.4<small>WINDOWS .MSI · LINUX .APPIMAGE</small>
           </a>
           <a class="stamp ghost" href="#s3">
             DRIVE THE SOLVER<small>NO INSTALL · RUNS HERE</small>
@@ -477,7 +477,7 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
       </div>
       <dl class="spec" data-draw>
         <div><dt>UNIT</dt><dd>TOKAMAK</dd></div>
-        <div><dt>VERSION</dt><dd>0.1.3</dd></div>
+        <div><dt>VERSION</dt><dd>0.1.4</dd></div>
         <div><dt>PLATFORM</dt><dd>WINDOWS · LINUX x64 · NVIDIA</dd></div>
         <div><dt>SHELL</dt><dd>TAURI 2 · RUST + REACT</dd></div>
         <div><dt>ENGINE</dt><dd>llama.cpp — MANAGED</dd></div>
@@ -640,9 +640,10 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
            run it — or a <code>.deb</code> or <code>.rpm</code> if you would rather it
            went through your package manager. Built on Ubuntu&nbsp;22.04, so it wants
            22.04 or an equivalently recent distribution.</p>
-        <p>These are new, and the interface has not yet been seen rendering on a real
-           Linux desktop session. If it comes up blank, please open an issue with your
-           distribution, GPU and session type.</p>
+        <p>Run and checked on Fedora, which is one desktop session and not all of
+           them. If it comes up blank on yours, open an issue with your distribution,
+           GPU and session type — WebKitGTK not finding a working EGL display is the
+           usual cause.</p>
         <span class="go">LATEST RELEASE →</span>
       </a>
     </div>
@@ -827,8 +828,8 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
           <tr><td class="r">D</td><td class="s">SHIPPED</td><td class="w">Chat and agent tabs, sandboxed workspace tools, full session history</td></tr>
           <tr><td class="r">E</td><td class="s">SHIPPED</td><td class="w">In-app model downloads and a managed llama.cpp runtime</td></tr>
           <tr><td class="r">F</td><td class="s">SHIPPED</td><td class="w">Speculative decoding — draft picker with tokenizer-compatibility checks and VRAM budgeting, and a live accept-rate readout in the cockpit</td></tr>
-          <tr class="now"><td class="r">G</td><td class="s">▸ NEXT</td><td class="w">Conversation branching — fork at any message, compare branches side by side</td></tr>
-          <tr><td class="r">H</td><td class="s">LATER</td><td class="w">LoRA hot-swap, multi-GPU tensor-parallel control, local quant conversion</td></tr>
+          <tr><td class="r">G</td><td class="s">SHIPPED</td><td class="w">Conversation branching — retry a reply or continue from any point down a new branch, switch between versions in place, and compare them side by side with the settings and the cost that produced each</td></tr>
+          <tr class="now"><td class="r">H</td><td class="s">▸ NEXT</td><td class="w">LoRA hot-swap, multi-GPU tensor-parallel control, local quant conversion</td></tr>
         </tbody>
       </table>
     </div>
@@ -838,7 +839,7 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
 
 <footer>
   <div class="wrap fgrid">
-    <span>TOKAMAK · v0.1.3 · MPL-2.0</span>
+    <span>TOKAMAK · v0.1.4 · MPL-2.0</span>
     <span>WINDOWS + LINUX · NVIDIA FIRST</span>
     <span class="sp"><a href="https://github.com/360NoScopeGuru/tokamak">GITHUB.COM/360NOSCOPEGURU/TOKAMAK</a></span>
   </div>
@@ -850,7 +851,7 @@ footer{border-top:1px solid var(--c-rule);padding:32px 0 clamp(56px,8vw,90px);
   <div class="r"><span>SHEET <b id="tbNo">01</b>/07</span></div>
   <div class="r"><span class="sec" id="tbSec">COLD START</span></div>
   <div class="r opt"><span id="tbState">○ UNPOWERED</span></div>
-  <div class="r opt"><span>v0.1.3 · MPL-2.0</span></div>
+  <div class="r opt"><span>v0.1.4 · MPL-2.0</span></div>
   <div class="r end"><a href="https://github.com/360NoScopeGuru/tokamak/releases/latest">▸ DOWNLOAD</a></div>
 </aside>
 
