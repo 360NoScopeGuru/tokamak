@@ -10,6 +10,7 @@ mod gguf;
 mod history;
 mod llama;
 mod ollama;
+mod quant;
 mod runtime;
 mod scanner;
 mod settings;
@@ -527,6 +528,61 @@ fn estimate_configs(
     Ok(out)
 }
 
+/// Measure, rather than estimate, what this model would weigh at each quant.
+///
+/// The ladder in `estimate_config` is free and instant because it is arithmetic
+/// over an average bits-per-weight table. This spawns `llama-quantize --dry-run`
+/// per rung instead, which is llama.cpp's own answer for this specific model's
+/// tensors. It costs a few hundred milliseconds a rung, so it is asked for
+/// rather than computed on every selection.
+///
+/// Returns `tool: None` rather than an error when no `llama-quantize` is
+/// present: having no runtime installed is an ordinary state, and the estimated
+/// ladder is still on screen.
+#[tauri::command(async)]
+fn quant_measure(
+    window: tauri::Window,
+    telemetry: State<'_, TelemetryState>,
+    model_path: String,
+) -> Result<quant::QuantMeasurement, String> {
+    use tauri::Emitter;
+    let Some(tool) = quant::tool_path() else {
+        return Ok(quant::QuantMeasurement {
+            tool: None,
+            source_bytes: 0,
+            source_bpw: 0.0,
+            source_label: None,
+            requantize: false,
+            rungs: Vec::new(),
+        });
+    };
+
+    let path = Path::new(&model_path);
+    let md = gguf::read_gguf_metadata(path).map_err(|e| e.to_string())?;
+    let file_size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| e.to_string())?;
+    let (gpu_total, _) = estimate_gpu(&telemetry.snapshot())?;
+    let mut notes = Vec::new();
+    let shape = estimator::shape_from_metadata(&md, file_size, &mut notes)
+        .ok_or_else(|| "insufficient model metadata to measure against".to_string())?;
+
+    quant::measure_ladder(
+        &tool,
+        path,
+        &shape,
+        md.quant_label.as_deref(),
+        gpu_total,
+        estimate_kv(),
+        &mut |done, total, label| {
+            let _ = window.emit(
+                "quant-progress",
+                serde_json::json!({ "done": done, "total": total, "label": label }),
+            );
+        },
+    )
+}
+
 /// Export accumulated suite results as a Markdown report in Documents.
 #[tauri::command]
 fn export_bench_report(
@@ -596,6 +652,7 @@ pub fn run() {
             inference_metrics,
             estimate_config,
             estimate_configs,
+            quant_measure,
             benchmark_model,
             export_bench_report,
             chat_send,

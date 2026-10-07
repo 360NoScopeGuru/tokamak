@@ -121,9 +121,28 @@ pub struct QuantAdvice {
     pub options: Vec<QuantOption>,
 }
 
+/// Judge an exact weights size against this GPU.
+///
+/// Returns (fits, headroom). Exists so a rung whose size was *measured* by
+/// `llama-quantize --dry-run` is judged by the same budget, KV and overhead
+/// terms as the estimated rungs in `quant_advice`. Two numbers from different
+/// formulas sitting in one ladder would not be comparable, and the whole point
+/// of measuring is to compare.
+pub fn judge_weights(
+    shape: &ModelShape,
+    weights: u64,
+    gpu_total: u64,
+    kv_type: KvType,
+) -> (bool, u64) {
+    let budget = (gpu_total as f64 * VRAM_HEADROOM) as u64;
+    let ctx = 8192u64.min(shape.native_ctx);
+    let total = weights + kv_bytes(shape, ctx, shape.n_layers, kv_type) + OVERHEAD_BYTES;
+    (total <= budget, budget.saturating_sub(total))
+}
+
 /// Known GGUF quant levels, best quality first, with effective bits-per-weight
 /// (llama.cpp's commonly cited averages, which include the quant's metadata).
-const QUANT_LADDER: &[(&str, f64)] = &[
+pub(crate) const QUANT_LADDER: &[(&str, f64)] = &[
     ("F16", 16.0),
     ("Q8_0", 8.5),
     ("Q6_K", 6.59),

@@ -134,6 +134,35 @@ export interface QuantOption {
   is_current: boolean;
 }
 
+/// One ladder rung whose size llama.cpp measured, rather than one the
+/// bits-per-weight table estimated.
+export interface MeasuredRung {
+  label: string;
+  weights_bytes: number;
+  bpw: number;
+  fits: boolean;
+  headroom_bytes: number;
+  is_current: boolean;
+  /// A higher-quality rung produces a file this size or smaller, so this one
+  /// is strictly worse. Only measurement finds these.
+  dominated: boolean;
+}
+
+/// The result of `quant_measure`: what this model could become, exactly.
+export interface QuantMeasurement {
+  /// `null` when no `llama-quantize` is installed. Not an error; the estimated
+  /// ladder stays on screen.
+  tool: string | null;
+  source_bytes: number;
+  source_bpw: number;
+  source_label: string | null;
+  /// The source is already quantized, so producing any rung would be a
+  /// requantize: llama.cpp refuses by default and quality drops further than
+  /// the target quant implies.
+  requantize: boolean;
+  rungs: MeasuredRung[];
+}
+
 export interface QuantAdvice {
   est_params_b: number;
   current_label: string | null;

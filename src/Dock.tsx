@@ -2,11 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   BenchResult,
   InferenceMetrics,
   ModelEntry,
   QuantAdvice,
+  QuantMeasurement,
   VramEstimate,
   ctxLabel,
   gb,
@@ -137,29 +141,133 @@ function ContextCol({ est }: { est: VramEstimate }) {
   );
 }
 
-function AdvisorCol({ advice }: { advice: QuantAdvice }) {
+/// The estimated ladder, refinable into a measured one.
+///
+/// The estimate is arithmetic over an average bits-per-weight table, so it is
+/// free and always on screen. Measuring spawns `llama-quantize --dry-run` per
+/// rung, which is llama.cpp's own answer for this model's actual tensors, and
+/// costs a few hundred milliseconds each — hence a button rather than an
+/// automatic refresh. The two disagreed by as much as 24% on a 30B MoE, in
+/// both directions, so the refinement is not cosmetic.
+function AdvisorCol({ advice, modelPath }: { advice: QuantAdvice; modelPath: string }) {
   const rec = advice.recommended;
+  const [measured, setMeasured] = useState<QuantMeasurement | null>(null);
+  const [busy, setBusy] = useState<{ done: number; total: number; label: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  // A measurement belongs to one model. Selecting another must not leave the
+  // previous model's exact sizes sitting under the new one's name.
+  useEffect(() => {
+    setMeasured(null);
+    setErr(null);
+    setBusy(null);
+  }, [modelPath]);
+
+  useEffect(() => {
+    let dead = false;
+    let un: (() => void) | undefined;
+    listen<{ done: number; total: number; label: string }>("quant-progress", (e) => {
+      // Only while a run of ours is open, so a late event cannot bring the
+      // counter back after the ladder has been replaced.
+      setBusy((b) => (b ? e.payload : b));
+    })
+      .then((u) => (dead ? u() : (un = u)))
+      .catch(() => {});
+    return () => {
+      dead = true;
+      un?.();
+    };
+  }, []);
+
+  async function measure() {
+    setErr(null);
+    setBusy({ done: 0, total: 0, label: "" });
+    try {
+      setMeasured(await invoke<QuantMeasurement>("quant_measure", { modelPath }));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const exact = measured?.tool ? measured : null;
+
   return (
     <div className="dock-col">
-      <div className="lbl faint">Quant Advisor · ~{advice.est_params_b.toFixed(0)}B · this GPU</div>
-      <div className="ladder">
-        {advice.options.map((o) => {
-          const isRec = !!rec && o.label === rec;
-          return (
-            <span key={o.label} className={`rung ${o.is_current ? "current" : ""}`}>
-              <span className={o.fits ? "ok" : "no"}>{o.fits ? "✓" : "✗"}</span>
-              <span className={`k ${o.is_current || isRec ? "hot" : ""}`}>{o.label}</span>
-              <span className="v">{gb(o.est_weights_bytes)} GB</span>
-              {isRec ? (
-                <span className="tag rec">● sweet spot</span>
-              ) : o.fits ? (
-                <span className="tag dim">+{gb(o.headroom_bytes)} GB</span>
+      <div className="lbl faint">
+        {exact ? "Quant Advisor · measured" : `Quant Advisor · ~${advice.est_params_b.toFixed(0)}B`}{" "}
+        · this GPU
+      </div>
+
+      {exact ? (
+        <div className="ladder">
+          {exact.rungs.length === 0 && (
+            <span className="rung">
+              <span className="tag dim">nothing below {exact.source_label ?? "this quant"}</span>
+            </span>
+          )}
+          {exact.rungs.map((r) => (
+            <span key={r.label} className={`rung ${r.is_current ? "current" : ""}`}>
+              <span className={r.fits ? "ok" : "no"}>{r.fits ? "✓" : "✗"}</span>
+              <span className={`k ${r.is_current ? "hot" : ""}`}>{r.label}</span>
+              <span className="v">{gb(r.weights_bytes)} GB</span>
+              {r.dominated ? (
+                <span className="tag bad" title="a higher-quality rung is this size or smaller">
+                  dominated
+                </span>
+              ) : r.fits ? (
+                <span className="tag rec">+{gb(r.headroom_bytes)} GB</span>
               ) : (
                 <span className="tag bad">over w/ kv</span>
               )}
             </span>
-          );
-        })}
+          ))}
+        </div>
+      ) : (
+        <div className="ladder">
+          {advice.options.map((o) => {
+            const isRec = !!rec && o.label === rec;
+            return (
+              <span key={o.label} className={`rung ${o.is_current ? "current" : ""}`}>
+                <span className={o.fits ? "ok" : "no"}>{o.fits ? "✓" : "✗"}</span>
+                <span className={`k ${o.is_current || isRec ? "hot" : ""}`}>{o.label}</span>
+                <span className="v">{gb(o.est_weights_bytes)} GB</span>
+                {isRec ? (
+                  <span className="tag rec">● sweet spot</span>
+                ) : o.fits ? (
+                  <span className="tag dim">+{gb(o.headroom_bytes)} GB</span>
+                ) : (
+                  <span className="tag bad">over w/ kv</span>
+                )}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="advisor-foot">
+        {busy ? (
+          <span className="faint">
+            measuring{busy.total ? ` ${busy.done}/${busy.total}` : ""}
+            {busy.label ? ` · ${busy.label}` : ""}
+          </span>
+        ) : err ? (
+          <span className="bad" title={err}>
+            could not measure
+          </span>
+        ) : measured && !measured.tool ? (
+          <span className="faint">install a runtime to measure exactly</span>
+        ) : exact ? (
+          <span className="faint">
+            {exact.source_label ?? "source"} at {exact.source_bpw.toFixed(2)} BPW
+            {exact.requantize ? " · requantizing costs quality beyond the target" : ""}
+          </span>
+        ) : (
+          <button onClick={measure} title="ask llama.cpp the exact size of each rung">
+            ⟐ measure exactly
+          </button>
+        )}
       </div>
     </div>
   );
@@ -326,7 +434,11 @@ export function Dock(p: DockProps) {
         <div className="dock-grid">
           <BudgetCol est={est} kvRatio={null} />
           <ContextCol est={est} />
-          {est.quant_advice ? <AdvisorCol advice={est.quant_advice} /> : <div className="dock-col" />}
+          {est.quant_advice ? (
+            <AdvisorCol advice={est.quant_advice} modelPath={p.selected.path} />
+          ) : (
+            <div className="dock-col" />
+          )}
         </div>
       </div>
     );
