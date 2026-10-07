@@ -4,11 +4,13 @@
 
 import {
   ModelEntry,
+  ScanPhase,
   ScanRoot,
   VramEstimate,
   ctxLabel,
   gb,
 } from "./types";
+import { ScanStatus } from "./ScanStatus";
 
 // Fuel library (left panel): every GGUF on disk with a live fit verdict
 // against the GPU. Hovering a row projects its footprint onto the rod bank;
@@ -18,7 +20,7 @@ interface LibraryProps {
   models: ModelEntry[];
   visionDirs: Set<string>;
   roots: ScanRoot[];
-  scanning: boolean;
+  scan: ScanPhase;
   estimates: Map<string, VramEstimate>;
   runningPath: string | null;
   busy: boolean;
@@ -63,16 +65,17 @@ function dirKey(path: string): string {
 
 export function Library(p: LibraryProps) {
   const totalBytes = p.models.reduce((s, m) => s + m.size_bytes, 0);
+  const scanning = p.scan.kind !== "idle";
   return (
     <div className="library">
       <div className="lib-head">
         <span className="lbl">Fuel Library</span>
         <span className="lib-count">
-          {p.models.length} GGUF · {gb(totalBytes, 1)} GB{p.scanning ? " · scanning…" : ""}
+          {p.models.length} GGUF · {gb(totalBytes, 1)} GB
         </span>
       </div>
       <div className="lib-actions">
-        <button onClick={p.onRescan} disabled={p.scanning}>
+        <button onClick={p.onRescan} disabled={scanning}>
           ↻ Rescan
         </button>
         <button
@@ -88,8 +91,10 @@ export function Library(p: LibraryProps) {
         <button onClick={p.onAddFolder}>+ Dir</button>
       </div>
 
+      <ScanStatus phase={p.scan} />
+
       <div className="lib-scroll" onMouseLeave={() => p.onHover(null)}>
-        {p.models.length === 0 && !p.scanning && (
+        {p.models.length === 0 && !scanning && (
           <div className="dock-empty" style={{ padding: "24px 20px" }}>
             <div className="inner">
               <span className="sub">

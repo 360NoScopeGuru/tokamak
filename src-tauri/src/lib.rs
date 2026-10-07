@@ -27,11 +27,18 @@ use scanner::{ModelEntry, ScanRoot};
 use telemetry::{TelemetrySnapshot, TelemetryState};
 
 /// Scan default caches + persisted user folders + any extra ad-hoc folders.
+///
+/// Emits `scan-progress` as each root is opened and each model found, so the
+/// library can fill in and name the folder it is walking instead of showing a
+/// bare "scanning…" that is indistinguishable from a hang.
 #[tauri::command(async)]
-fn scan_models(extra_dirs: Vec<String>) -> Vec<ModelEntry> {
+fn scan_models(window: tauri::Window, extra_dirs: Vec<String>) -> Vec<ModelEntry> {
+    use tauri::Emitter;
     let mut dirs = settings::load().extra_model_dirs;
     dirs.extend(extra_dirs);
-    scanner::scan_models(&dirs)
+    scanner::scan_models_reporting(&dirs, &mut |p| {
+        let _ = window.emit("scan-progress", &p);
+    })
 }
 
 /// Rank the local library as draft models for `target_path`, for speculative
@@ -391,20 +398,12 @@ fn inference_metrics(state: State<'_, LlamaManager>) -> Option<InferenceMetrics>
     state.metrics()
 }
 
-/// Estimate the optimal GPU-offload + context config for a model on this GPU.
-#[tauri::command(async)]
-fn estimate_config(
-    telemetry: State<'_, TelemetryState>,
-    model_path: String,
-) -> Result<VramEstimate, String> {
-    let path = Path::new(&model_path);
-    let md = gguf::read_gguf_metadata(path).map_err(|e| e.to_string())?;
-    let file_size = std::fs::metadata(path)
-        .map(|m| m.len())
-        .map_err(|e| e.to_string())?;
-
-    let snap = telemetry.snapshot();
-    let (gpu_total, gpu_free) = snap
+/// The GPU an estimate is made against: (total, free) VRAM in bytes.
+///
+/// Split out because it is the same answer for every model in a library, and
+/// taking it once per model meant one NVML round trip per model.
+fn estimate_gpu(snap: &TelemetrySnapshot) -> Result<(u64, u64), String> {
+    let (total, free) = snap
         .gpus
         .first()
         .map(|g| {
@@ -414,17 +413,31 @@ fn estimate_config(
             )
         })
         .unwrap_or((0, 0));
-    if gpu_total == 0 {
+    if total == 0 {
         return Err("no GPU detected to estimate against".into());
     }
+    Ok((total, free))
+}
+
+/// The per-model half of an estimate, with the GPU and the KV setting handed in.
+///
+/// Those two are properties of the machine and the configuration, not of the
+/// model, so the callers read them once and this does only the work that
+/// genuinely differs per file: its header and the arithmetic.
+fn estimate_one(
+    path: &Path,
+    gpu_total: u64,
+    gpu_free: u64,
+    kv: estimator::KvType,
+) -> Result<VramEstimate, String> {
+    let md = gguf::read_gguf_metadata(path).map_err(|e| e.to_string())?;
+    let file_size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| e.to_string())?;
 
     let mut notes = Vec::new();
     let shape = estimator::shape_from_metadata(&md, file_size, &mut notes)
         .ok_or_else(|| "insufficient model metadata to estimate".to_string())?;
-    // The KV cache type is a launch setting, and it changes how much context
-    // fits — so the estimate has to be made under the same setting the server
-    // will actually run with, or the ladder promises context that won't exist.
-    let kv = estimator::KvType::parse(settings::load().kv_cache_type.as_deref());
     let mut est = estimator::estimate(&shape, gpu_total, gpu_free, kv, notes);
     est.quant_advice = estimator::quant_advice(
         &shape,
@@ -434,6 +447,84 @@ fn estimate_config(
         kv,
     );
     Ok(est)
+}
+
+/// The KV cache type is a launch setting, and it changes how much context fits,
+/// so the estimate has to be made under the same setting the server will
+/// actually run with or the ladder promises context that will not exist.
+fn estimate_kv() -> estimator::KvType {
+    estimator::KvType::parse(settings::load().kv_cache_type.as_deref())
+}
+
+/// Estimate the optimal GPU-offload + context config for a model on this GPU.
+#[tauri::command(async)]
+fn estimate_config(
+    telemetry: State<'_, TelemetryState>,
+    model_path: String,
+) -> Result<VramEstimate, String> {
+    let (gpu_total, gpu_free) = estimate_gpu(&telemetry.snapshot())?;
+    estimate_one(Path::new(&model_path), gpu_total, gpu_free, estimate_kv())
+}
+
+/// One model's verdict in a batch: an estimate, or why it has none.
+///
+/// Carries the failure per entry rather than failing the call, because one
+/// unreadable file in a library of fifty must not cost the other forty-nine
+/// their verdict.
+#[derive(serde::Serialize)]
+struct BatchEstimate {
+    path: String,
+    estimate: Option<VramEstimate>,
+    error: Option<String>,
+}
+
+/// Estimate a whole library in one call, emitting `estimate-progress` as it goes.
+///
+/// `estimate_config` is the right shape for the single model a user just
+/// staged, and the wrong shape for priming a library. Called in a loop it paid,
+/// per model, one IPC round trip, one NVML snapshot and one read-and-parse of
+/// `settings.json` — none of which vary by model. On a 22-model library the
+/// snapshots alone measured 156ms of identical answers (see `perf`). That was
+/// the second freeze on startup.
+///
+/// The GPU and the KV setting are now read once for the batch. What is *not*
+/// removed is the GGUF header read: each model genuinely needs its own, and
+/// although the scan parsed them all moments earlier, caching them would mean
+/// holding metadata that can go stale under the user's own file operations.
+/// Since the header fix that is a couple of milliseconds a file, which is not
+/// worth an invalidation bug.
+#[tauri::command(async)]
+fn estimate_configs(
+    window: tauri::Window,
+    telemetry: State<'_, TelemetryState>,
+    model_paths: Vec<String>,
+) -> Result<Vec<BatchEstimate>, String> {
+    use tauri::Emitter;
+    let (gpu_total, gpu_free) = estimate_gpu(&telemetry.snapshot())?;
+    let kv = estimate_kv();
+    let total = model_paths.len();
+
+    let mut out = Vec::with_capacity(total);
+    for (i, path) in model_paths.iter().enumerate() {
+        let (estimate, error) = match estimate_one(Path::new(path), gpu_total, gpu_free, kv) {
+            Ok(e) => (Some(e), None),
+            Err(e) => (None, Some(e)),
+        };
+        let entry = BatchEstimate {
+            path: path.clone(),
+            estimate,
+            error,
+        };
+        // The verdict rides along with the progress count, so rows still fill
+        // in one by one the way they did when each model had its own invoke.
+        // Events are one-way, so this costs no round trip.
+        let _ = window.emit(
+            "estimate-progress",
+            serde_json::json!({ "done": i + 1, "total": total, "entry": &entry }),
+        );
+        out.push(entry);
+    }
+    Ok(out)
 }
 
 /// Export accumulated suite results as a Markdown report in Documents.
@@ -504,6 +595,7 @@ pub fn run() {
             llama_status,
             inference_metrics,
             estimate_config,
+            estimate_configs,
             benchmark_model,
             export_bench_report,
             chat_send,
@@ -522,4 +614,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod perf {
+    /// Prices the per-model overhead that `estimate_configs` exists to remove.
+    ///
+    /// Priming the library through `estimate_config` paid all of this once per
+    /// model: a read and parse of `settings.json` for the KV type, and an NVML
+    /// snapshot for the GPU. Neither answer varies by model, so both are now
+    /// read once for the whole batch. Run with:
+    ///   cargo test -- --ignored --nocapture estimate_overhead_is_per_library
+    #[test]
+    #[ignore] // touches the real config dir and NVML
+    fn estimate_overhead_is_per_library() {
+        const N: u32 = 22; // the library this was diagnosed against
+
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = super::estimate_kv();
+        }
+        let settings = t.elapsed();
+
+        let telemetry = super::TelemetryState::new();
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = telemetry.snapshot();
+        }
+        let snapshots = t.elapsed();
+
+        eprintln!("for a {N}-model library, per-model overhead the batch now skips:");
+        eprintln!("  settings.json reads: {settings:?} ({N} of them)");
+        eprintln!("  NVML snapshots:      {snapshots:?} ({N} of them)");
+        eprintln!("  the batch pays 1/{N} of each, plus one IPC call instead of {N}");
+    }
 }

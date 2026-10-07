@@ -123,18 +123,65 @@ pub fn default_roots_info() -> Vec<ScanRoot> {
     roots
 }
 
+/// What the scanner is doing right now, so the UI can say so.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProgress {
+    /// The root being walked, as a path, or "Ollama" for the manifest pass.
+    pub root: String,
+    /// Which root this is, 1-based, out of `total_roots`.
+    pub root_index: usize,
+    pub total_roots: usize,
+    /// Models found so far, across every root.
+    pub found: usize,
+}
+
 /// Scan the default roots plus any `extra_dirs` (labeled "folder") for GGUF models.
 pub fn scan_models(extra_dirs: &[String]) -> Vec<ModelEntry> {
+    scan_models_reporting(extra_dirs, &mut |_| {})
+}
+
+/// `scan_models`, reporting what it is doing as it goes.
+///
+/// `report` fires when a root is opened and again on each model found, so the
+/// window can name the folder being walked rather than only claim that
+/// something is happening. On a warm local disk this flashes past; it earns its
+/// keep when a root is a network mount or a cold drive, which is precisely when
+/// the user most needs telling that the app has not hung.
+pub fn scan_models_reporting(
+    extra_dirs: &[String],
+    report: &mut dyn FnMut(ScanProgress),
+) -> Vec<ModelEntry> {
     let mut roots = default_roots();
     for d in extra_dirs {
         roots.push((PathBuf::from(d), "folder".into()));
     }
-    let roots = dedupe_roots(roots);
+    walk_roots(dedupe_roots(roots), true, report)
+}
 
+/// The scan proper, over an explicit root list.
+///
+/// Taking the roots as an argument rather than building them is what lets the
+/// progress test scan one directory it planted instead of the whole machine's
+/// caches: a test that walks the user's real library is both slow and unable to
+/// assert an exact count, since the answer depends on whose disk it runs on.
+fn walk_roots(
+    roots: Vec<(PathBuf, String)>,
+    include_ollama: bool,
+    report: &mut dyn FnMut(ScanProgress),
+) -> Vec<ModelEntry> {
     let mut entries: Vec<ModelEntry> = Vec::new();
     let mut seen_paths: Vec<PathBuf> = Vec::new();
+    // The Ollama pass is one more step than there are directories, when it runs
+    // at all — counting it keeps the progress fraction honest.
+    let total_roots = roots.len() + usize::from(include_ollama);
 
-    for (root, source) in &roots {
+    for (i, (root, source)) in roots.iter().enumerate() {
+        report(ScanProgress {
+            root: root.to_string_lossy().into_owned(),
+            root_index: i + 1,
+            total_roots,
+            found: entries.len(),
+        });
         if !root.is_dir() {
             continue;
         }
@@ -151,9 +198,26 @@ pub fn scan_models(extra_dirs: &[String]) -> Vec<ModelEntry> {
             seen_paths.push(key);
 
             entries.push(build_entry(path, source));
+            report(ScanProgress {
+                root: root.to_string_lossy().into_owned(),
+                root_index: i + 1,
+                total_roots,
+                found: entries.len(),
+            });
         }
     }
 
+    if !include_ollama {
+        entries.sort_by_cached_key(|e| e.file_name.to_lowercase());
+        return entries;
+    }
+
+    report(ScanProgress {
+        root: "Ollama".into(),
+        root_index: total_roots,
+        total_roots,
+        found: entries.len(),
+    });
     // Ollama's store is content-addressed, so it needs manifest lookups rather
     // than a file walk. Skip any blob already reached through another root.
     for m in crate::ollama::discover() {
@@ -170,6 +234,12 @@ pub fn scan_models(extra_dirs: &[String]) -> Vec<ModelEntry> {
         entry.display_name = Some(m.name);
         entry.size_bytes = m.size_bytes;
         entries.push(entry);
+        report(ScanProgress {
+            root: "Ollama".into(),
+            root_index: total_roots,
+            total_roots,
+            found: entries.len(),
+        });
     }
 
     entries.sort_by_cached_key(|e| e.file_name.to_lowercase());
@@ -256,6 +326,48 @@ mod tests {
         assert!(is_mmproj_name("mmproj-Qwen3.6-27B-BF16.gguf"));
         assert!(is_mmproj_name("MMPROJ-model.gguf"));
         assert!(!is_mmproj_name("Qwen3.6-27B-Q4_K_M.gguf"));
+    }
+
+    /// Progress has to be usable as a fraction: it may never count backwards,
+    /// and it must finish on the number actually returned. The UI draws a bar
+    /// from these, and a bar that retreats or stops short reads as a bug in the
+    /// scan rather than in the reporting.
+    #[test]
+    fn progress_counts_up_to_exactly_what_was_found() {
+        let dir = std::env::temp_dir().join(format!("tokamak-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        // Empty files: `build_entry` records a parse error and lists them
+        // anyway, which is what we want. This is a test about counting.
+        std::fs::write(dir.join("alpha.gguf"), b"").unwrap();
+        std::fs::write(dir.join("nested").join("beta.gguf"), b"").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not a model").unwrap();
+
+        let mut seen: Vec<ScanProgress> = Vec::new();
+        // One root, no Ollama pass: the machine's own caches are irrelevant
+        // here, and including them would make the count depend on whose disk
+        // the suite runs on.
+        let entries = walk_roots(vec![(dir.clone(), "folder".into())], false, &mut |p| {
+            seen.push(p)
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(entries.len(), 2, "the .txt must not be counted as a model");
+        // Opening the root, then one report per model found.
+        assert_eq!(
+            seen.iter().map(|p| p.found).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "every found model should move the count by exactly one"
+        );
+        for p in &seen {
+            assert_eq!((p.root_index, p.total_roots), (1, 1));
+        }
+        assert_eq!(
+            seen.last().unwrap().found,
+            entries.len(),
+            "the last report must agree with what was returned"
+        );
     }
 
     /// Real end-to-end scan of whatever models are on this machine's caches.

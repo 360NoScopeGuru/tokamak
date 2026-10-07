@@ -42,6 +42,34 @@ export interface ScanRoot {
   exists: boolean;
 }
 
+/// A `scan-progress` event: which root is being walked and how many models
+/// have turned up so far.
+export interface ScanProgress {
+  root: string;
+  root_index: number;
+  total_roots: number;
+  found: number;
+}
+
+/// One model's fit verdict from `estimate_configs`, or why it has none. A file
+/// that cannot be read reports its own failure instead of sinking the batch.
+export interface BatchEstimate {
+  path: string;
+  estimate: VramEstimate | null;
+  error: string | null;
+}
+
+/// What the app is doing before the library is ready to use.
+///
+/// Startup has two distinct stages that used to look identical from the
+/// outside: finding the files, then working out which of them fit. They are
+/// named separately because "still looking" and "nearly done" are different
+/// things to be told.
+export type ScanPhase =
+  | { kind: "idle" }
+  | { kind: "scanning"; root: string; rootIndex: number; totalRoots: number; found: number }
+  | { kind: "estimating"; done: number; total: number };
+
 export interface GpuSnapshot {
   index: number;
   name: string;
