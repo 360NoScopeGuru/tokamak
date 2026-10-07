@@ -47,6 +47,12 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
+      # The Rust side has had tests since the start; this is the half that was
+      # missing. Rev G shipped three bugs in pure functions that a unit test
+      # would have caught before the branch was even pushed.
+      - name: Frontend tests
+        run: npm test
+
       # -D warnings is what keeps dead code from accumulating: two unused items
       # survived from July precisely because nothing failed on a warning.
       - name: Clippy
