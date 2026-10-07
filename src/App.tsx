@@ -16,10 +16,13 @@ import { Sessions } from "./Sessions";
 import { Downloads } from "./Downloads";
 import { FluxSample } from "./Flux";
 import {
+  BatchEstimate,
   BenchResult,
   InferenceMetrics,
   LlamaBinary,
   ModelEntry,
+  ScanPhase,
+  ScanProgress,
   ScanRoot,
   ServerStatus,
   DraftCandidate,
@@ -61,7 +64,10 @@ const KV_TYPES: { id: KvType; label: string; hint: string }[] = [
 export default function App() {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [roots, setRoots] = useState<ScanRoot[]>([]);
-  const [scanning, setScanning] = useState(false);
+  // Startup has two stages worth naming separately; see `ScanPhase`. The
+  // library derives its own "busy" flag from this rather than a bare boolean,
+  // so the panel can say which stage it is in.
+  const [phase, setPhase] = useState<ScanPhase>({ kind: "idle" });
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
   const [metrics, setMetrics] = useState<InferenceMetrics | null>(null);
@@ -123,7 +129,7 @@ export default function App() {
   // ---- scanning + estimates ----
 
   async function rescan() {
-    setScanning(true);
+    setPhase({ kind: "scanning", root: "", rootIndex: 0, totalRoots: 0, found: 0 });
     try {
       const [rootList, modelList] = await Promise.all([
         invoke<ScanRoot[]>("scan_roots"),
@@ -131,21 +137,77 @@ export default function App() {
       ]);
       setRoots(rootList);
       setModels(modelList);
-      // Prime fit estimates for every primary model (cheap: header + NVML).
-      for (const m of modelList) {
-        if (m.is_shard_continuation || m.is_mmproj || m.parse_error || m.load_blocker)
-          continue;
-        if (estimatesRef.current.has(m.path)) continue;
-        invoke<VramEstimate>("estimate_config", { modelPath: m.path })
-          .then((est) => setEstimates((prev) => new Map(prev).set(m.path, est)))
-          .catch(() => {});
-      }
+
+      // Prime fit verdicts for every primary model. One call for the whole
+      // library, not one per model: priming them separately meant an IPC round
+      // trip, an NVML snapshot, a read of settings.json and a second parse of
+      // an already-parsed GGUF header *each*, which was the second of the two
+      // startup freezes. Verdicts still arrive one at a time, pushed by
+      // `estimate-progress`.
+      const want = modelList.filter(
+        (m) =>
+          !m.is_shard_continuation &&
+          !m.is_mmproj &&
+          !m.parse_error &&
+          !m.load_blocker &&
+          !estimatesRef.current.has(m.path)
+      );
+      if (want.length === 0) return;
+      setPhase({ kind: "estimating", done: 0, total: want.length });
+      // Swallowed deliberately, and separately from the scan above. This call
+      // fails outright on a machine with no NVML GPU, which is every AMD, Intel
+      // and Apple one — the per-model version each had its own ignored catch,
+      // so failing here used to mean no fit verdicts, not an error banner on
+      // every scan. Finding models still has to work without a GPU.
+      await invoke<BatchEstimate[]>("estimate_configs", {
+        modelPaths: want.map((m) => m.path),
+      }).catch(() => {});
     } catch (e) {
       setError(String(e));
     } finally {
-      setScanning(false);
+      setPhase({ kind: "idle" });
     }
   }
+
+  // Both startup stages report what they are doing. The guards matter: a late
+  // event must not resurrect the strip once the scan has finished, which is
+  // easy to hit because the last few arrive while the batch call is resolving.
+  useEffect(() => {
+    const uns: Array<() => void> = [];
+    let disposed = false;
+    const keep = (un: () => void) => (disposed ? un() : uns.push(un));
+
+    listen<ScanProgress>("scan-progress", (e) => {
+      const p = e.payload;
+      setPhase((cur) =>
+        cur.kind === "scanning"
+          ? {
+              kind: "scanning",
+              root: p.root,
+              rootIndex: p.root_index,
+              totalRoots: p.total_roots,
+              found: p.found,
+            }
+          : cur
+      );
+    })
+      .then(keep)
+      .catch(() => {});
+
+    listen<{ done: number; total: number; entry: BatchEstimate }>("estimate-progress", (e) => {
+      const { done, total, entry } = e.payload;
+      setPhase((cur) => (cur.kind === "estimating" ? { kind: "estimating", done, total } : cur));
+      const est = entry.estimate;
+      if (est) setEstimates((prev) => new Map(prev).set(entry.path, est));
+    })
+      .then(keep)
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      for (const un of uns) un();
+    };
+  }, []);
 
   useEffect(() => {
     rescan();
@@ -804,7 +866,7 @@ export default function App() {
           models={primary}
           visionDirs={visionDirs}
           roots={roots}
-          scanning={scanning}
+          scan={phase}
           estimates={estimates}
           runningPath={runningPath ?? null}
           busy={busy}

@@ -300,6 +300,48 @@ select:focus {
   min-height: 0;
 }
 
+/* Startup progress. Sits between the actions and the list, so it reads as a
+   note about the list rather than an overlay on top of it — nothing below is
+   disabled while it shows. */
+.scan-status {
+  padding: 0 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.scan-status-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.scan-status-label {
+  font: 10.5px var(--mono);
+  color: var(--mid);
+  letter-spacing: 0.04em;
+}
+/* `--low`, not `--faint`: this is the text telling the user what the app is
+   doing, and the palette reserves faint for decoration. */
+.scan-status-detail {
+  font: 10.5px var(--mono);
+  color: var(--low);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scan-status-track {
+  height: 2px;
+  background: var(--hair2);
+  overflow: hidden;
+}
+.scan-status-fill {
+  height: 100%;
+  background: var(--plasma);
+  /* The walk jumps a whole root at a time, so without easing the bar snaps in
+     visible steps and reads as stalling between them. */
+  transition: width 180ms ease-out;
+}
+
 .sessions {
   flex: 1 1 42%;
   display: flex;
