@@ -291,3 +291,31 @@ mod tests {
         format!("{gb:.2}GB")
     }
 }
+
+#[cfg(test)]
+mod perf {
+    /// Times a real scan against this machine's own model roots.
+    ///
+    /// Kept because this was once ten seconds, every one of them spent on the
+    /// UI thread. The cause was `gguf::skip` seeking past each string in a
+    /// tokenizer vocab, which threw away the `BufReader` buffer ~150k times
+    /// per array. If this creeps back into seconds, that is the first place to
+    /// look. The bound is deliberately loose: it is here to catch a return to
+    /// the old order of magnitude, not to police milliseconds.
+    #[test]
+    #[ignore] // walks the machine's real model dirs; run with --ignored
+    fn scan_is_not_pathological() {
+        let t = std::time::Instant::now();
+        let entries = super::scan_models(&[]);
+        let elapsed = t.elapsed();
+        let parsed = entries.iter().filter(|e| e.metadata.is_some()).count();
+        eprintln!(
+            "scan_models: {elapsed:?} for {} entries ({parsed} headers parsed)",
+            entries.len()
+        );
+        assert!(
+            elapsed.as_secs() < 3,
+            "scan took {elapsed:?}; it should be well under a second"
+        );
+    }
+}
