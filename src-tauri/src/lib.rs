@@ -27,7 +27,7 @@ use scanner::{ModelEntry, ScanRoot};
 use telemetry::{TelemetrySnapshot, TelemetryState};
 
 /// Scan default caches + persisted user folders + any extra ad-hoc folders.
-#[tauri::command]
+#[tauri::command(async)]
 fn scan_models(extra_dirs: Vec<String>) -> Vec<ModelEntry> {
     let mut dirs = settings::load().extra_model_dirs;
     dirs.extend(extra_dirs);
@@ -37,7 +37,7 @@ fn scan_models(extra_dirs: Vec<String>) -> Vec<ModelEntry> {
 /// Rank the local library as draft models for `target_path`, for speculative
 /// decoding. Answers up front what `llama-server` would otherwise only tell you
 /// by refusing to start after a long model load.
-#[tauri::command]
+#[tauri::command(async)]
 fn draft_candidates(
     telemetry: State<'_, TelemetryState>,
     target_path: String,
@@ -81,7 +81,7 @@ fn draft_candidates(
 
 /// Report all scan roots — defaults plus persisted user folders — and whether
 /// each currently exists (for the roots UI).
-#[tauri::command]
+#[tauri::command(async)]
 fn scan_roots() -> Vec<ScanRoot> {
     let mut roots = scanner::default_roots_info();
     for dir in settings::load().extra_model_dirs {
@@ -119,7 +119,7 @@ fn set_preferred_binary(path: Option<String>) -> Result<settings::Settings, Stri
 }
 
 /// List saved chat/code sessions, newest first.
-#[tauri::command]
+#[tauri::command(async)]
 fn history_list() -> Result<Vec<history::SessionMeta>, String> {
     history::list()
 }
@@ -216,7 +216,7 @@ fn runtime_status() -> runtime::RuntimeStatus {
 }
 
 /// Installable llama.cpp builds for this machine, with real download sizes.
-#[tauri::command]
+#[tauri::command(async)]
 fn runtime_options(telemetry: State<'_, TelemetryState>) -> Result<Vec<runtime::RuntimeBuild>, String> {
     let has_nvidia = !telemetry.snapshot().gpus.is_empty();
     runtime::options(has_nvidia)
@@ -359,7 +359,7 @@ fn true_client_size(_window: tauri::Window) -> Option<(i32, i32)> {
 }
 
 /// List available llama-server binaries, best-ranked first.
-#[tauri::command]
+#[tauri::command(async)]
 fn llama_binaries() -> Vec<LlamaBinary> {
     llama::resolve_binaries()
 }
@@ -392,7 +392,7 @@ fn inference_metrics(state: State<'_, LlamaManager>) -> Option<InferenceMetrics>
 }
 
 /// Estimate the optimal GPU-offload + context config for a model on this GPU.
-#[tauri::command]
+#[tauri::command(async)]
 fn estimate_config(
     telemetry: State<'_, TelemetryState>,
     model_path: String,

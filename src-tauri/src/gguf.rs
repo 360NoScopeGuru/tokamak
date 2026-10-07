@@ -244,8 +244,30 @@ impl<R: Read + Seek> Reader<R> {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// Advance `n` bytes.
+    ///
+    /// `BufReader::seek` throws the whole buffer away, so seeking past a short
+    /// string costs a fresh syscall on the very next read. Tokenizer vocabs run
+    /// to ~150k strings and `skip_array_body` walks them one at a time, which
+    /// made that ~150k discarded buffers per array and turned a header read
+    /// into a third of a second. Short hops are consumed through the buffer
+    /// instead; only jumps bigger than a buffer are worth a real seek.
     fn skip(&mut self, n: u64) -> Result<(), GgufError> {
-        self.inner.seek(SeekFrom::Current(n as i64))?;
+        const BUFFERED_HOP: u64 = 8 * 1024;
+        if n <= BUFFERED_HOP {
+            // Unlike `seek`, consuming stops at EOF without complaining, so a
+            // truncated file would quietly under-skip and desync every key
+            // after it. Say so here instead of failing somewhere confusing.
+            let got = std::io::copy(&mut self.inner.by_ref().take(n), &mut std::io::sink())?;
+            if got != n {
+                return Err(GgufError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("file ended {} bytes into a {n}-byte skip", got),
+                )));
+            }
+        } else {
+            self.inner.seek(SeekFrom::Current(n as i64))?;
+        }
         Ok(())
     }
 
@@ -537,6 +559,39 @@ mod tests {
         assert_eq!(md.quant_label.as_deref(), Some("Q4_K_M"));
         assert_eq!(md.context_length, Some(4096));
         assert_eq!(md.block_count, Some(32));
+    }
+
+    /// `skip` has two paths — consume through the buffer, or a real seek — and
+    /// a desync in either silently corrupts every key *after* the array rather
+    /// than failing outright. This drives both: a short string, one straddling
+    /// the 8 KiB threshold, and one well past it, with real keys behind them.
+    #[test]
+    fn string_arrays_of_every_length_leave_the_cursor_in_the_right_place() {
+        let short = "a".repeat(16);
+        let edge = "b".repeat(8 * 1024);
+        let long = "c".repeat(40 * 1024);
+        let mut body = Vec::new();
+        kv_str(&mut body, "general.architecture", "qwen3");
+        kv_str_array(&mut body, "tokenizer.ggml.tokens", &[&short, &edge, &long]);
+        kv_u32(&mut body, "qwen3.block_count", 48);
+        kv_str(&mut body, "general.name", "After The Array");
+
+        let md = read_metadata(Cursor::new(build_gguf(4, body))).expect("parses");
+        assert_eq!(md.architecture.as_deref(), Some("qwen3"));
+        assert_eq!(md.block_count, Some(48), "key after the array desynced");
+        assert_eq!(md.name.as_deref(), Some("After The Array"));
+    }
+
+    /// A file cut off inside a skip must fail, not return half a header.
+    #[test]
+    fn truncation_inside_a_skip_is_an_error() {
+        let mut body = Vec::new();
+        kv_str(&mut body, "general.architecture", "llama");
+        kv_str_array(&mut body, "tokenizer.ggml.tokens", &["aaaa", "bbbb"]);
+        kv_u32(&mut body, "llama.block_count", 32);
+        let mut bytes = build_gguf(3, body);
+        bytes.truncate(bytes.len() - 24);
+        assert!(read_metadata(Cursor::new(bytes)).is_err());
     }
 
     /// Grounded in real files, not invented: every model that loads on the
