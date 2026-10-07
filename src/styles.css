@@ -1704,6 +1704,25 @@ select:focus {
   gap: 4px;
   font: 11px var(--mono);
 }
+
+/* Under the quant ladder: the measure action, then what measuring found. One
+   line either way, so refining the ladder does not shift the column height. */
+.advisor-foot {
+  margin-top: 6px;
+  font: 10.5px var(--mono);
+  min-height: 18px;
+  display: flex;
+  align-items: center;
+}
+.advisor-foot .faint {
+  color: var(--low);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.advisor-foot .bad {
+  color: var(--danger);
+}
 .ladder .rung {
   display: flex;
   gap: 10px;
