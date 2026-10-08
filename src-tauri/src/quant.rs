@@ -625,11 +625,26 @@ llama_quantize: failed to quantize model from 'C:/models/x.gguf'
 
     #[test]
     fn output_replaces_the_source_quant_in_the_name() {
-        let p = Path::new(r"C:\m\Qwen3.6-27B-Q4_K_M.gguf");
+        let p = Path::new("/m/Qwen3.6-27B-Q4_K_M.gguf");
         assert_eq!(
             output_path(p, Some("Q4_K_M"), "Q3_K_M").file_name().unwrap(),
             "Qwen3.6-27B-Q3_K_M.gguf"
         );
+    }
+
+    /// Backslash-separated paths, which only `Path` on Windows splits.
+    ///
+    /// Gated because a `C:\…` literal is not a path on Linux at all — it is one
+    /// long file name with no separators, so `file_stem` returns the whole
+    /// thing. An earlier version of the test above used one and passed on
+    /// Windows while failing in CI, which is the job that check exists to do.
+    #[test]
+    #[cfg(windows)]
+    fn output_handles_windows_separators() {
+        let p = Path::new(r"C:\models\org\Qwen3.6-27B-Q4_K_M.gguf");
+        let out = output_path(p, Some("Q4_K_M"), "Q3_K_M");
+        assert_eq!(out.file_name().unwrap(), "Qwen3.6-27B-Q3_K_M.gguf");
+        assert_eq!(out.parent(), p.parent());
     }
 
     #[test]
