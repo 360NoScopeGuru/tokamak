@@ -8,6 +8,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   BenchResult,
   InferenceMetrics,
+  MeasuredRung,
   ModelEntry,
   QuantAdvice,
   QuantMeasurement,
@@ -22,6 +23,21 @@ import {
 // advisor. Live → live budget | session stats | context ladder. After a
 // single-model bench → the measured per-config table.
 
+/// The conversion, owned by `App` rather than by the advisor column.
+///
+/// A conversion runs for minutes, and this column unmounts whenever another
+/// model is selected or the dock switches to the live view. Holding the state
+/// here would take the event listener down with it: the completion event would
+/// be lost, the library would never be told to rescan, and the backend slot
+/// would stay claimed with nothing on screen able to release or stop it.
+export interface QuantConvertUi {
+  running: { label: string; done: number; total: number } | null;
+  /// How the last one ended, until something replaces it.
+  result: { output: string | null; error: string | null } | null;
+  onMake: (quant: string, sourceLabel: string | null, allowRequantize: boolean) => void;
+  onStop: () => void;
+}
+
 interface DockProps {
   selected: ModelEntry | null;
   selectedEst: VramEstimate | null;
@@ -32,6 +48,7 @@ interface DockProps {
   uptimeMs: number | null;
   benchDetail: { name: string; expected: number; results: BenchResult[]; running: boolean } | null;
   onCloseBench: () => void;
+  quant: QuantConvertUi;
 }
 
 function uptime(ms: number): string {
@@ -149,18 +166,32 @@ function ContextCol({ est }: { est: VramEstimate }) {
 /// costs a few hundred milliseconds each — hence a button rather than an
 /// automatic refresh. The two disagreed by as much as 24% on a 30B MoE, in
 /// both directions, so the refinement is not cosmetic.
-function AdvisorCol({ advice, modelPath }: { advice: QuantAdvice; modelPath: string }) {
+function AdvisorCol({
+  advice,
+  modelPath,
+  quant,
+}: {
+  advice: QuantAdvice;
+  modelPath: string;
+  quant: QuantConvertUi;
+}) {
   const rec = advice.recommended;
   const [measured, setMeasured] = useState<QuantMeasurement | null>(null);
   const [busy, setBusy] = useState<{ done: number; total: number; label: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  /// Which rung is awaiting confirmation. Purely local: nothing has been asked
+  /// of the backend yet.
+  const [asking, setAsking] = useState<MeasuredRung | null>(null);
 
   // A measurement belongs to one model. Selecting another must not leave the
-  // previous model's exact sizes sitting under the new one's name.
+  // previous model's exact sizes sitting under the new one's name. The
+  // conversion is *not* reset here, because it does not belong to this
+  // component — see `App`.
   useEffect(() => {
     setMeasured(null);
     setErr(null);
     setBusy(null);
+    setAsking(null);
   }, [modelPath]);
 
   useEffect(() => {
@@ -168,7 +199,8 @@ function AdvisorCol({ advice, modelPath }: { advice: QuantAdvice; modelPath: str
     let un: (() => void) | undefined;
     listen<{ done: number; total: number; label: string }>("quant-progress", (e) => {
       // Only while a run of ours is open, so a late event cannot bring the
-      // counter back after the ladder has been replaced.
+      // counter back after the ladder has been replaced. Measuring is bounded
+      // by a few seconds, so losing it on unmount costs nothing.
       setBusy((b) => (b ? e.payload : b));
     })
       .then((u) => (dead ? u() : (un = u)))
@@ -221,6 +253,18 @@ function AdvisorCol({ advice, modelPath }: { advice: QuantAdvice; modelPath: str
               ) : (
                 <span className="tag bad">over w/ kv</span>
               )}
+              {/* Offered on every rung, including the ones that will not fit
+                  and the dominated ones: the verdict is already stated beside
+                  it, and someone converting for another machine is entitled to
+                  a size this GPU cannot hold. */}
+              <button
+                className="rung-make"
+                disabled={!!quant.running || r.is_current}
+                onClick={() => setAsking(r)}
+                title={`write a ${r.label} copy beside this model`}
+              >
+                make
+              </button>
             </span>
           ))}
         </div>
@@ -247,14 +291,54 @@ function AdvisorCol({ advice, modelPath }: { advice: QuantAdvice; modelPath: str
       )}
 
       <div className="advisor-foot">
-        {busy ? (
+        {asking ? (
+          // Stated before anything is written, because this is the one action
+          // here that costs real time and real disk. The requantize warning is
+          // llama.cpp's own default talking: it refuses this without a flag.
+          <span className="confirm">
+            <span className="faint">
+              write {asking.label} · {gb(asking.weights_bytes)} GB
+              {exact?.requantize ? ` · requantizing from ${exact.source_label ?? "a quant"} loses quality` : ""}
+            </span>
+            <button
+              onClick={() => {
+                const r = asking;
+                setAsking(null);
+                quant.onMake(r.label, measured?.source_label ?? null, !!measured?.requantize);
+              }}
+            >
+              write it
+            </button>
+            <button onClick={() => setAsking(null)}>cancel</button>
+          </span>
+        ) : quant.running ? (
+          <span className="confirm">
+            <span className="faint">
+              writing {quant.running.label}
+              {quant.running.total
+                ? ` · ${quant.running.done}/${quant.running.total} tensors`
+                : ""}
+            </span>
+            <button onClick={quant.onStop}>stop</button>
+          </span>
+        ) : quant.result?.error ? (
+          <span className="bad" title={quant.result.error}>
+            {quant.result.error.length > 48
+              ? `${quant.result.error.slice(0, 48)}…`
+              : quant.result.error}
+          </span>
+        ) : quant.result?.output ? (
+          <span className="faint" title={quant.result.output}>
+            ✓ wrote {quant.result.output.split(/[\\/]/).pop()}
+          </span>
+        ) : busy ? (
           <span className="faint">
             measuring{busy.total ? ` ${busy.done}/${busy.total}` : ""}
             {busy.label ? ` · ${busy.label}` : ""}
           </span>
         ) : err ? (
           <span className="bad" title={err}>
-            could not measure
+            {err.length > 48 ? `${err.slice(0, 48)}…` : err}
           </span>
         ) : measured && !measured.tool ? (
           <span className="faint">install a runtime to measure exactly</span>
@@ -435,7 +519,7 @@ export function Dock(p: DockProps) {
           <BudgetCol est={est} kvRatio={null} />
           <ContextCol est={est} />
           {est.quant_advice ? (
-            <AdvisorCol advice={est.quant_advice} modelPath={p.selected.path} />
+            <AdvisorCol advice={est.quant_advice} modelPath={p.selected.path} quant={p.quant} />
           ) : (
             <div className="dock-col" />
           )}

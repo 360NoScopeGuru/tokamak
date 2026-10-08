@@ -583,6 +583,41 @@ fn quant_measure(
     )
 }
 
+/// Convert a model to another quant, in the background.
+///
+/// Returns the path the result will take so the UI can name it before the work
+/// starts. Progress arrives as `quant-convert`; the file only appears under that
+/// name once it is complete, because the conversion writes to a `.part` first.
+///
+/// `allow_requantize` has to be asked for. llama.cpp refuses to requantize an
+/// already-quantized model by default, and that default is right: quality drops
+/// further than the target quant implies. Tokamak surfaces the choice rather
+/// than passing the flag quietly.
+#[tauri::command]
+fn quant_convert_start(
+    window: tauri::Window,
+    state: State<'_, quant::QuantState>,
+    model_path: String,
+    quant: String,
+    source_label: Option<String>,
+    allow_requantize: bool,
+) -> Result<String, String> {
+    quant::start(
+        window,
+        &state,
+        std::path::PathBuf::from(model_path),
+        quant,
+        source_label,
+        allow_requantize,
+    )
+}
+
+/// Ask the running conversion to stop. The partial file is removed.
+#[tauri::command]
+fn quant_convert_cancel(state: State<'_, quant::QuantState>) {
+    state.cancel();
+}
+
 /// Export accumulated suite results as a Markdown report in Documents.
 #[tauri::command]
 fn export_bench_report(
@@ -624,6 +659,7 @@ pub fn run() {
         .manage(LlamaManager::new())
         .manage(chat::ChatState::default())
         .manage(downloads::DownloadState::default())
+        .manage(quant::QuantState::default())
         .invoke_handler(tauri::generate_handler![
             scan_models,
             scan_roots,
@@ -653,6 +689,8 @@ pub fn run() {
             estimate_config,
             estimate_configs,
             quant_measure,
+            quant_convert_start,
+            quant_convert_cancel,
             benchmark_model,
             export_bench_report,
             chat_send,
