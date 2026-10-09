@@ -163,6 +163,17 @@ export interface QuantMeasurement {
   rungs: MeasuredRung[];
 }
 
+/// A `quant-convert` event. `done`/`total` count tensors while it runs; the
+/// terminal event carries one of `output`, `cancelled` or `error`.
+export interface ConvertProgress {
+  done: number;
+  total: number;
+  output: string | null;
+  finished: boolean;
+  cancelled: boolean;
+  error: string | null;
+}
+
 export interface QuantAdvice {
   est_params_b: number;
   current_label: string | null;

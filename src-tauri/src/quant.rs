@@ -21,8 +21,11 @@
 //! table predicts and IQ4_XS 6% denser per weight. Near the edge of a card's
 //! budget, that difference is the difference between loading and not.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
@@ -265,6 +268,262 @@ pub fn measure_ladder(
     })
 }
 
+// ---- conversion ----
+
+/// How far a conversion has got, and how it ended.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvertProgress {
+    /// Tensors written, out of the model's total.
+    pub done: u32,
+    pub total: u32,
+    /// The finished file, set only once it is in place under its real name.
+    pub output: Option<String>,
+    pub finished: bool,
+    pub cancelled: bool,
+    pub error: Option<String>,
+}
+
+impl ConvertProgress {
+    fn at(done: u32, total: u32) -> Self {
+        ConvertProgress {
+            done,
+            total,
+            output: None,
+            finished: false,
+            cancelled: false,
+            error: None,
+        }
+    }
+}
+
+/// One conversion at a time.
+///
+/// Quantizing saturates disk and CPU, so a second run would make both slower
+/// and could fill the disk twice over while doing it. A single slot also means
+/// the UI can report progress honestly instead of summing two unrelated runs.
+/// Holds an `Arc` rather than the mutex directly so the worker thread can own a
+/// handle and clear the slot itself when it finishes, without reaching back into
+/// Tauri's managed state.
+#[derive(Default, Clone)]
+pub struct QuantState {
+    slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl QuantState {
+    /// Claim the slot, or refuse because it is taken.
+    fn arm(&self) -> Result<Arc<AtomicBool>, String> {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.is_some() {
+            return Err("a conversion is already running".into());
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        *slot = Some(flag.clone());
+        Ok(flag)
+    }
+
+    fn release(&self) {
+        *self.slot.lock().unwrap() = None;
+    }
+
+    pub fn cancel(&self) {
+        if let Some(f) = self.slot.lock().unwrap().as_ref() {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Parse `[ 304/ 310]` off the front of a per-tensor line.
+///
+/// This is the only progress llama-quantize offers, and it is worth having: a
+/// real conversion runs for minutes, and a bar that moves is the difference
+/// between waiting and force-quitting.
+pub fn parse_tensor_progress(line: &str) -> Option<(u32, u32)> {
+    let inner = line.trim_start().strip_prefix('[')?;
+    let (inner, _) = inner.split_once(']')?;
+    let (done, total) = inner.split_once('/')?;
+    Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
+/// Where a conversion's result goes: beside the source, with the quant named.
+///
+/// Beside the source because that is the least surprising answer to "convert
+/// this model", and because every directory the scanner walks is one the library
+/// already shows, so the result appears without another step. When the source's
+/// own quant is in its file name it is replaced rather than appended, so a
+/// Q4_K_M converted to Q3_K_M does not come out as `…-Q4_K_M-Q3_K_M`.
+pub fn output_path(model: &Path, source_label: Option<&str>, quant: &str) -> PathBuf {
+    let stem = model
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = match source_label {
+        // The label is ASCII, so trimming it off a matched suffix cannot land
+        // inside a multi-byte character.
+        Some(l)
+            if !l.is_empty()
+                && stem
+                    .to_ascii_uppercase()
+                    .ends_with(&l.to_ascii_uppercase()) =>
+        {
+            stem[..stem.len() - l.len()]
+                .trim_end_matches(['-', '_', '.'])
+                .to_string()
+        }
+        _ => stem,
+    };
+    model.with_file_name(format!("{base}-{quant}.gguf"))
+}
+
+/// Convert `model` to `quant`, reporting progress and leaving nothing behind.
+///
+/// Writes to `<output>.part` and renames only on success. This is not caution
+/// for its own sake: a refused or interrupted run **does** leave a truncated
+/// GGUF where its output was pointed. One was observed at 5.9 MB, with eight
+/// zero bytes where the magic belongs — so it would scan as a parse error
+/// rather than masquerade as a model, but it would still sit in the library
+/// until someone deleted it by hand.
+#[allow(clippy::too_many_arguments)]
+pub fn convert(
+    tool: &Path,
+    model: &Path,
+    quant: &str,
+    output: &Path,
+    allow_requantize: bool,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(ConvertProgress),
+) -> Result<PathBuf, String> {
+    if output.exists() {
+        return Err(format!("{} already exists", output.display()));
+    }
+    let part = output.with_extension("gguf.part");
+    let _ = std::fs::remove_file(&part);
+
+    let mut cmd = Command::new(tool);
+    if allow_requantize {
+        cmd.arg("--allow-requantize");
+    }
+    cmd.arg(model).arg(&part).arg(quant);
+    // Progress arrives on stderr; stdout is captured too so a build that moves
+    // it does not silently lose the bar.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", tool.display()))?;
+
+    let stderr = child.stderr.take().ok_or("no stderr from llama-quantize")?;
+    let mut tail: Vec<String> = Vec::new();
+    let mut killed = false;
+
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        // Checked between lines rather than on a timer. llama-quantize emits one
+        // per tensor, so the gap is short in practice, and this needs no second
+        // thread to own the child handle.
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            killed = true;
+            break;
+        }
+        if let Some((done, total)) = parse_tensor_progress(&line) {
+            report(ConvertProgress::at(done, total));
+        }
+        // Kept for the error message: llama.cpp explains a refusal in prose,
+        // and the exit code alone cannot say "requantizing is disabled".
+        tail.push(line);
+        if tail.len() > 40 {
+            tail.remove(0);
+        }
+    }
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+
+    if killed || cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&part);
+        return Err("cancelled".into());
+    }
+    if !status.success() {
+        let _ = std::fs::remove_file(&part);
+        let why = tail
+            .iter()
+            .rev()
+            .find(|l| l.contains("failed") || l.contains("error"))
+            .cloned()
+            .unwrap_or_else(|| format!("llama-quantize exited with {status}"));
+        return Err(why);
+    }
+
+    std::fs::rename(&part, output).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        format!("converted, but could not move into place: {e}")
+    })?;
+    Ok(output.to_path_buf())
+}
+
+/// Run a conversion on a worker thread, emitting `quant-convert`.
+pub fn start(
+    window: tauri::Window,
+    state: &QuantState,
+    model: PathBuf,
+    quant: String,
+    source_label: Option<String>,
+    allow_requantize: bool,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let tool = tool_path().ok_or("no llama-quantize found; install a runtime first")?;
+    let output = output_path(&model, source_label.as_deref(), &quant);
+    let cancel = state.arm()?;
+
+    let shown = output.display().to_string();
+    std::thread::spawn({
+        let output = output.clone();
+        let slot = state.clone();
+        move || {
+            let emit = |p: ConvertProgress| {
+                let _ = window.emit("quant-convert", &p);
+            };
+            let result = convert(
+                &tool,
+                &model,
+                &quant,
+                &output,
+                allow_requantize,
+                &cancel,
+                &mut |p| emit(p),
+            );
+            // Released before the terminal event, so a UI that immediately
+            // starts another conversion on "finished" is not refused.
+            slot.release();
+            match result {
+                Ok(path) => emit(ConvertProgress {
+                    done: 0,
+                    total: 0,
+                    output: Some(path.display().to_string()),
+                    finished: true,
+                    cancelled: false,
+                    error: None,
+                }),
+                Err(e) if e == "cancelled" => emit(ConvertProgress {
+                    done: 0,
+                    total: 0,
+                    output: None,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                }),
+                Err(e) => emit(ConvertProgress {
+                    done: 0,
+                    total: 0,
+                    output: None,
+                    finished: true,
+                    cancelled: false,
+                    error: Some(e),
+                }),
+            }
+        }
+    });
+    Ok(shown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +599,289 @@ llama_quantize: failed to quantize model from 'C:/models/x.gguf'
         assert!(!is_full_precision("Q4_K_M"));
         assert!(!is_full_precision("IQ4_XS"));
         assert!(!is_full_precision("Q8_0"));
+    }
+
+    #[test]
+    fn reads_the_tensor_counter() {
+        // The real spacing, which pads the numbers to align the column.
+        assert_eq!(parse_tensor_progress("[   1/ 310] output_norm.weight"), Some((1, 310)));
+        assert_eq!(parse_tensor_progress("[ 304/ 310] blk.27.attn_q.weight"), Some((304, 310)));
+        assert_eq!(parse_tensor_progress("[1/2] x"), Some((1, 2)));
+    }
+
+    #[test]
+    fn ignores_lines_that_are_not_the_counter() {
+        for line in [
+            "llama_model_quantize_impl: model size  = 604.15 MiB (8.50 BPW)",
+            "",
+            "[not/numbers] x",
+            // A bracket with no slash, and a slash with no bracket.
+            "[310] done",
+            "1/310 tensors",
+        ] {
+            assert_eq!(parse_tensor_progress(line), None, "should ignore {line:?}");
+        }
+    }
+
+    #[test]
+    fn output_replaces_the_source_quant_in_the_name() {
+        let p = Path::new("/m/Qwen3.6-27B-Q4_K_M.gguf");
+        assert_eq!(
+            output_path(p, Some("Q4_K_M"), "Q3_K_M").file_name().unwrap(),
+            "Qwen3.6-27B-Q3_K_M.gguf"
+        );
+    }
+
+    /// Backslash-separated paths, which only `Path` on Windows splits.
+    ///
+    /// Gated because a `C:\…` literal is not a path on Linux at all — it is one
+    /// long file name with no separators, so `file_stem` returns the whole
+    /// thing. An earlier version of the test above used one and passed on
+    /// Windows while failing in CI, which is the job that check exists to do.
+    #[test]
+    #[cfg(windows)]
+    fn output_handles_windows_separators() {
+        let p = Path::new(r"C:\models\org\Qwen3.6-27B-Q4_K_M.gguf");
+        let out = output_path(p, Some("Q4_K_M"), "Q3_K_M");
+        assert_eq!(out.file_name().unwrap(), "Qwen3.6-27B-Q3_K_M.gguf");
+        assert_eq!(out.parent(), p.parent());
+    }
+
+    #[test]
+    fn output_appends_when_the_name_does_not_carry_a_quant() {
+        let p = Path::new("/m/mystery-model.gguf");
+        assert_eq!(
+            output_path(p, Some("Q4_K_M"), "Q3_K_M").file_name().unwrap(),
+            "mystery-model-Q3_K_M.gguf"
+        );
+        // And when the source quant is unknown entirely.
+        assert_eq!(
+            output_path(p, None, "Q3_K_M").file_name().unwrap(),
+            "mystery-model-Q3_K_M.gguf"
+        );
+    }
+
+    /// The label on disk is not always the case the metadata reports, and a
+    /// mismatch would leave both quants in the name.
+    #[test]
+    fn output_matches_the_source_quant_case_insensitively() {
+        let p = Path::new("/m/qwen2.5-coder-32b-instruct-q5_k_m.gguf");
+        assert_eq!(
+            output_path(p, Some("Q5_K_M"), "Q3_K_M").file_name().unwrap(),
+            "qwen2.5-coder-32b-instruct-Q3_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn output_stays_beside_the_source() {
+        let p = Path::new("/models/org/repo/m-Q8_0.gguf");
+        let out = output_path(p, Some("Q8_0"), "Q4_K_M");
+        assert_eq!(out.parent(), p.parent());
+    }
+
+    /// Two conversions at once would fight over the disk, so the second is
+    /// refused rather than queued.
+    #[test]
+    fn only_one_conversion_holds_the_slot() {
+        let state = QuantState::default();
+        let first = state.arm().expect("slot should be free");
+        assert!(state.arm().is_err(), "a second claim must be refused");
+
+        // Cancelling signals the holder; the slot stays taken until the worker
+        // releases it, or a cancel would let a second run start while the first
+        // is still winding down.
+        state.cancel();
+        assert!(first.load(Ordering::Relaxed));
+        assert!(state.arm().is_err(), "still held until the worker releases");
+
+        state.release();
+        assert!(state.arm().is_ok(), "the slot should be reusable");
+    }
+
+    /// Pick the smallest real model on this machine, for tests that convert.
+    #[cfg(test)]
+    fn smallest_model() -> Option<crate::scanner::ModelEntry> {
+        crate::scanner::scan_models(&[])
+            .into_iter()
+            .filter(|m| !m.is_shard_continuation && !m.is_mmproj && m.metadata.is_some())
+            .min_by_key(|m| m.size_bytes)
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tokamak-q-{}-{name}", std::process::id()))
+    }
+
+    /// Converts a real model and checks the result is actually loadable.
+    ///
+    /// The whole point of this module is producing a file llama.cpp will run, so
+    /// the assertion is that Tokamak's own GGUF parser can read the output and
+    /// agrees about what it is — not merely that a file appeared.
+    /// `cargo test -- --ignored --nocapture converts_a_real_model`
+    #[test]
+    #[ignore]
+    fn converts_a_real_model() {
+        let (Some(tool), Some(m)) = (tool_path(), smallest_model()) else {
+            eprintln!("no tool or no models; skipping");
+            return;
+        };
+        let src_label = m.metadata.as_ref().and_then(|d| d.quant_label.clone());
+        let out = scratch("converted.gguf");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(out.with_extension("gguf.part"));
+
+        eprintln!(
+            "converting {} ({:.2} GiB, {:?}) -> Q4_K_M",
+            m.file_name,
+            m.size_bytes as f64 / 1024.0f64.powi(3),
+            src_label
+        );
+
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        let t = std::time::Instant::now();
+        let result = convert(
+            &tool,
+            Path::new(&m.path),
+            "Q4_K_M",
+            &out,
+            // The source is quantized, so without this llama.cpp refuses.
+            true,
+            &cancel,
+            &mut |p| seen.push((p.done, p.total)),
+        );
+        let elapsed = t.elapsed();
+
+        let path = match result {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out);
+                panic!("conversion failed: {e}");
+            }
+        };
+        eprintln!("done in {elapsed:?}, {} progress reports", seen.len());
+
+        assert!(!seen.is_empty(), "a conversion should report progress");
+        let (_, total) = seen[0];
+        assert!(total > 0, "the counter needs a denominator");
+        // Monotonic, and it reaches the end.
+        for w in seen.windows(2) {
+            assert!(w[1].0 >= w[0].0, "counter went {} -> {}", w[0].0, w[1].0);
+        }
+        assert_eq!(seen.last().unwrap().0, total, "should finish every tensor");
+
+        // Nothing left over, and the result is under its real name.
+        assert!(path.is_file(), "output should exist");
+        assert!(
+            !out.with_extension("gguf.part").exists(),
+            "the .part must be gone"
+        );
+
+        // The real check: it parses, and it is the quant that was asked for.
+        let md = crate::gguf::read_gguf_metadata(&path).expect("output should be a valid GGUF");
+        eprintln!(
+            "output {:.2} GiB, quant {:?}, arch {:?}",
+            std::fs::metadata(&path).unwrap().len() as f64 / 1024.0f64.powi(3),
+            md.quant_label,
+            md.architecture
+        );
+        assert_eq!(
+            md.architecture,
+            m.metadata.as_ref().unwrap().architecture,
+            "conversion must not change the architecture"
+        );
+        assert!(
+            md.quant_label
+                .as_deref()
+                .map(|q| q.to_ascii_uppercase().contains("Q4"))
+                .unwrap_or(false),
+            "expected a Q4 label, got {:?}",
+            md.quant_label
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < m.size_bytes,
+            "Q4_K_M of a Q8_0 should be smaller"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Cancelling must leave the disk exactly as it was.
+    ///
+    /// This is the behaviour the module exists to guarantee: llama-quantize
+    /// itself leaves a truncated GGUF behind when a run ends early, and that
+    /// stub would sit in whichever model folder the output was pointed at.
+    /// `cargo test -- --ignored --nocapture cancelling_leaves_nothing_behind`
+    #[test]
+    #[ignore]
+    fn cancelling_leaves_nothing_behind() {
+        let (Some(tool), Some(m)) = (tool_path(), smallest_model()) else {
+            eprintln!("no tool or no models; skipping");
+            return;
+        };
+        let out = scratch("cancelled.gguf");
+        let part = out.with_extension("gguf.part");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&part);
+
+        // Cancelled from inside the progress callback rather than on a timer.
+        // A sleep races the conversion, and on a small model the conversion
+        // wins: an earlier version of this test cancelled after all 112 tensors
+        // had already gone by, so it proved the cleanup but never exercised
+        // killing a child mid-write.
+        const STOP_AFTER: usize = 5;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trip = cancel.clone();
+        let mut count = 0usize;
+        let mut total = 0u32;
+
+        let err = convert(
+            &tool,
+            Path::new(&m.path),
+            "Q4_K_M",
+            &out,
+            true,
+            &cancel,
+            &mut |p| {
+                count += 1;
+                total = p.total;
+                if count == STOP_AFTER {
+                    trip.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .expect_err("a cancelled conversion must not report success");
+
+        eprintln!("cancelled after {count} of {total} tensors: {err}");
+        assert_eq!(err, "cancelled");
+        assert!(
+            count < total as usize,
+            "cancelled at {count} of {total}: the child was not killed mid-run, \
+             so this did not test what it claims"
+        );
+        assert!(!part.exists(), "the .part must be cleaned up");
+        assert!(!out.exists(), "no output should appear under the real name");
+    }
+
+    /// Refusing to overwrite is checked before anything is spawned, so a typo
+    /// cannot cost someone a model they already have.
+    #[test]
+    fn will_not_overwrite_an_existing_file() {
+        let out = scratch("existing.gguf");
+        std::fs::write(&out, b"not really a model").unwrap();
+        let err = convert(
+            Path::new("llama-quantize-does-not-need-to-exist"),
+            Path::new("whatever.gguf"),
+            "Q4_K_M",
+            &out,
+            false,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .expect_err("should refuse");
+        assert!(err.contains("already exists"), "got {err}");
+        // And the file it refused to touch is untouched.
+        assert_eq!(std::fs::read(&out).unwrap(), b"not really a model");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Machine-dependent: proves the tool is where this module claims it is.

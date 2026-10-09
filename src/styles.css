@@ -1723,6 +1723,32 @@ select:focus {
 .advisor-foot .bad {
   color: var(--danger);
 }
+/* Confirm and in-flight rows: text then actions, on the one line the footer
+   reserves, so nothing below it moves while a conversion runs. */
+.advisor-foot .confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.advisor-foot .confirm button {
+  flex: none;
+}
+
+/* The per-rung "make" action. Dim until the row is hovered: the ladder is read
+   far more often than it is acted on, and eight live buttons would shout. */
+.rung-make {
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+.ladder .rung:hover .rung-make,
+.rung-make:focus-visible {
+  opacity: 1;
+}
+.rung-make:disabled {
+  opacity: 0;
+}
 .ladder .rung {
   display: flex;
   gap: 10px;

@@ -18,6 +18,7 @@ import { FluxSample } from "./Flux";
 import {
   BatchEstimate,
   BenchResult,
+  ConvertProgress,
   InferenceMetrics,
   LlamaBinary,
   ModelEntry,
@@ -122,6 +123,16 @@ export default function App() {
   const [rtBuilds, setRtBuilds] = useState<RuntimeBuild[] | null>(null);
   const [rtBusy, setRtBusy] = useState<string | null>(null);
   const [rtProgress, setRtProgress] = useState<{ stage: string; received: number; total: number } | null>(null);
+  // Quant conversion lives here, not in the dock column that triggers it: it
+  // runs for minutes, and that column unmounts on every model change. Holding
+  // it there would take the listener down mid-run and lose the completion.
+  const [convert, setConvert] = useState<{ label: string; done: number; total: number } | null>(
+    null
+  );
+  const [convertResult, setConvertResult] = useState<{
+    output: string | null;
+    error: string | null;
+  } | null>(null);
 
   const estimatesRef = useRef(estimates);
   estimatesRef.current = estimates;
@@ -190,6 +201,22 @@ export default function App() {
             }
           : cur
       );
+    })
+      .then(keep)
+      .catch(() => {});
+
+    listen<ConvertProgress>("quant-convert", (e) => {
+      const p = e.payload;
+      if (!p.finished) {
+        setConvert((c) => (c ? { ...c, done: p.done, total: p.total } : c));
+        return;
+      }
+      setConvert(null);
+      // A cancellation is the user's own doing and removed its own partial, so
+      // there is nothing to report back to them about it.
+      setConvertResult(p.cancelled ? null : { output: p.output, error: p.error });
+      // The file is on disk but the library has never heard of it.
+      if (p.output) rescan();
     })
       .then(keep)
       .catch(() => {});
@@ -916,6 +943,27 @@ export default function App() {
             onPickWorkspace={pickWorkspace}
           />
           <Dock
+            quant={{
+              running: convert,
+              result: convertResult,
+              onMake: (quant, sourceLabel, allowRequantize) => {
+                if (!selected) return;
+                setConvertResult(null);
+                setConvert({ label: quant, done: 0, total: 0 });
+                invoke<string>("quant_convert_start", {
+                  modelPath: selected.path,
+                  quant,
+                  sourceLabel,
+                  allowRequantize,
+                }).catch((e) => {
+                  setConvert(null);
+                  setConvertResult({ output: null, error: String(e) });
+                });
+              },
+              onStop: () => {
+                invoke("quant_convert_cancel").catch(() => {});
+              },
+            }}
             selected={selected}
             selectedEst={selectedEst}
             liveModel={runningModel}
